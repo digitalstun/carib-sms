@@ -2,10 +2,12 @@ import time
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
+from pydantic import BaseModel, Field
 from app.database import get_db, init_db
 from app.schemas import MessageCreate, MessageResponse, HealthResponse, FailoverState, FailoverUpdate, EscalationRequest, EscalationResponse
 from app.sms import generate_sid, send_sms_termux, send_sms_dry_run, record_delivery
 from app.whatsapp import escalate_message as whatsapp_escalate
+from app import remittance
 
 START_TIME = time.time()
 
@@ -271,3 +273,169 @@ def list_escalations_for_message(message_sid: str):
             "timestamp": r["timestamp"]
         } for r in rows
     ]
+
+
+# ============== Phase 3: Remittance Receipt Delivery (Single-Parish PoC) ==============
+
+class RemittancePayload(BaseModel):
+    recipient_phone: str = Field(..., description="Recipient phone number (E.164)")
+    amount_usd: float = Field(..., description="Transfer amount in USD")
+    sender_name: Optional[str] = Field(None, description="Sender name (optional)")
+    parish: Optional[str] = Field("kingston", description="Target parish for delivery routing")
+    transfer_id: str = Field(..., description="Remittance company transfer reference")
+    carrier_preference: Optional[str] = Field("digicel", description="Preferred carrier: digicel, flow, or clear")
+
+class RemittanceResponse(BaseModel):
+    transfer_id: str
+    recipient_phone: str
+    parish: str
+    message_sid: str
+    status: str
+    proof_of_delivery: dict
+    unit_economics: dict
+
+@app.post("/v1/remittance/receipt", response_model=RemittanceResponse)
+def remittance_receipt(payload: RemittancePayload):
+    """
+    Phase 3: Remittance receipt delivery.
+    Simulates single-parish PoC: receives webhook, sends SMS, captures delivery receipt,
+    returns proof-of-delivery bundle with unit economics.
+    """
+    import time
+    start_time = time.time()
+
+    # Select parish coordinates
+    parish = payload.parish or remittance.DEFAULT_PARISH
+    coords = remittance.REMITS_PARISH_COORDS.get(parish, remittance.REMITS_PARISH_COORDS.get(remittance.DEFAULT_PARISH))
+
+    # Generate message SID for tracking
+    sid = generate_sid()
+
+    # Build message body (remittance confirmation format)
+    body = f"[CARIBSMS] Remittance Confirmed: ${payload.amount_usd:.2f} USD received. Sender: {payload.sender_name or 'Unknown'}. Ref: {payload.transfer_id}. Confirm receipt."
+
+    # Store in DB (use existing message mechanism but tag as remittance)
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO messages (sid, to_number, from_number, body, status, direction) VALUES (?, ?, ?, ?, 'queued', 'outbound')",
+        (sid, payload.recipient_phone, "CARIBSMS-REM", body)
+    )
+    conn.commit()
+
+    # Simulate SMS dispatch (same mechanism as failover)
+    conn.execute("SELECT mode FROM failover_state WHERE id = 1")
+    mode_row = conn.execute("SELECT mode FROM failover_state WHERE id = 1").fetchone()
+    mode = mode_row["mode"] if mode_row else "test"
+
+    # For PoC: always send via simulated delivery (use dry-run to avoid burning real SMS on test)
+    # In production: this would use send_sms_termux directly with real SIM
+    result = send_sms_dry_run(payload.recipient_phone, body)
+
+    if result["success"]:
+        status = "delivered"
+        error_msg = None
+    else:
+        status = "failed"
+        error_msg = result.get("error", "Unknown dispatch error")
+
+    # Calculate latency
+    latency_ms = int((time.time() - start_time) * 1000)
+
+    # Look up simulated cost
+    carrier = payload.carrier_preference or remittance.DEFAULT_CARRIER
+    cost_jmd = remittance.CARRIER_SMS_COST_JMD.get(carrier, 24.0)
+
+    # Update message
+    conn.execute(
+        "UPDATE messages SET status = ?, updated_at = ?, error_message = ?, carrier_ack = ? WHERE sid = ?",
+        (status, time.time(), error_msg, f"remit-{carrier}-po-c", sid)
+    )
+    conn.commit()
+
+    # Record escalation (if needed) — not used in base remittance flow, but available
+    # Build proof-of-delivery bundle
+    proof = {
+        "transfer_reference": payload.transfer_id,
+        "message_sid": sid,
+        "recipient_phone": payload.recipient_phone,
+        "parish": parish,
+        "coordinates": coords,
+        "delivery_timestamp": time.time(),
+        "delivery_latency_ms": latency_ms,
+        "delivery_status": status,
+        "carrier_ack": f"remit-{carrier}-po-c",
+        "sim_phone_id": "android-poc-001",  # PoC: single device
+        "sim_carrier": carrier,
+        "sms_content_hash": sid[:8],  # simplified for PoC
+        "proof_type": "simulated-single-parish"
+    }
+
+    # Unit economics
+    unit_economics = {
+        "cost_per_sms_jmd": cost_jmd,
+        "cost_per_sms_usd": round(cost_jmd / 155.0, 4),  # Approx JMD→USD rate
+        "delivery_latency_ms": latency_ms,
+        "delivery_success_rate": 1.0 if status == "delivered" else 0.0,
+        "parish_targeted": parish,
+        "carrier_used": carrier,
+        "sim_device": "android-poc-001",
+        "notes": "Single-parish PoC — one Android device, simulated delivery for measurement"
+    }
+
+    conn.close()
+
+    return RemittanceResponse(
+        transfer_id=payload.transfer_id,
+        recipient_phone=payload.recipient_phone,
+        parish=parish,
+        message_sid=sid,
+        status=status,
+        proof_of_delivery=proof,
+        unit_economics=unit_economics
+    )
+
+
+@app.get("/v1/remittance/stats")
+def remittance_stats():
+    conn = get_db()
+    # Count remittance-related messages (those with CARIBSMS-REM from_number)
+    total = conn.execute("SELECT COUNT(*) as c FROM messages WHERE from_number = 'CARIBSMS-REM'").fetchone()["c"]
+    delivered = conn.execute("SELECT COUNT(*) as c FROM messages WHERE from_number = 'CARIBSMS-REM' AND status = 'delivered'").fetchone()["c"]
+    failed = conn.execute("SELECT COUNT(*) as c FROM messages WHERE from_number = 'CARIBSMS-REM' AND status = 'failed'").fetchone()["c"]
+    queued = conn.execute("SELECT COUNT(*) as c FROM messages WHERE from_number = 'CARIBSMS-REM' AND status = 'queued'").fetchone()["c"]
+    conn.close()
+
+    # Aggregate simulated economics
+    total_cost = total * remittance.CARRIER_SMS_COST_JMD.get(remittance.DEFAULT_CARRIER, 24.0)
+    success_rate = delivered / total if total > 0 else 0.0
+
+    return {
+        "total_remittances": total,
+        "delivered": delivered,
+        "failed": failed,
+        "queued": queued,
+        "success_rate": round(success_rate, 2),
+        "simulated_total_cost_jmd": round(total_cost, 2),
+        "simulated_avg_cost_usd": round(total_cost / 155.0, 4),
+        "po_c_parish": remittance.DEFAULT_PARISH,
+        "po_c_carrier": remittance.DEFAULT_CARRIER,
+        "po_c_notes": "Single-parish proof of concept. Real deployment requires multi-carrier Android pool."
+    }
+
+
+@app.get("/v1/remittance/parish/{parish}")
+def remittance_parish_info(parish: str):
+    """
+    Returns parish-level information for delivery routing.
+    Includes coordinates, supported carriers, and simulated delivery metrics.
+    """
+    info = remittance.REMITS_PARISH_COORDS.get(parish, remittance.REMITS_PARISH_COORDS.get(remittance.DEFAULT_PARISH))
+    return {
+        "parish": parish,
+        "coordinates": info,
+        "supported_carriers": list(remittance.CARRIER_SMS_COST_JMD.keys()),
+        "delivery_pool_size": 1,  # PoC: single device
+        "recommended_carrier": "digicel",
+        "estimated_delivery_latency_ms": 3000,  # Simulated
+        "status": "operational"
+    }
