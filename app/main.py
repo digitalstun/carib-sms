@@ -3,8 +3,9 @@ from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
 from app.database import get_db, init_db
-from app.schemas import MessageCreate, MessageResponse, HealthResponse, FailoverState, FailoverUpdate
+from app.schemas import MessageCreate, MessageResponse, HealthResponse, FailoverState, FailoverUpdate, EscalationRequest, EscalationResponse
 from app.sms import generate_sid, send_sms_termux, send_sms_dry_run, record_delivery
+from app.whatsapp import escalate_message as whatsapp_escalate
 
 START_TIME = time.time()
 
@@ -190,3 +191,83 @@ def get_failover_state():
     if not row:
         return FailoverState(mode="normal")
     return FailoverState(mode=row["mode"], activated_at=row["activated_at"])
+
+
+@app.post("/v1/escalate", response_model=EscalationResponse)
+def escalate(msg: EscalationRequest):
+    """Escalate a failed SMS message to WhatsApp Business API."""
+    conn = get_db()
+    row = conn.execute("SELECT * FROM messages WHERE sid = ?", (msg.sid,)).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    # Only escalate if SMS failed or is queued (not already delivered)
+    if row["status"] == "delivered":
+        conn.close()
+        raise HTTPException(status_code=400, detail="Message already delivered via SMS — escalation not needed")
+
+    # Call WhatsApp escalation
+    result = whatsapp_escalate(
+        sid=msg.sid,
+        to_number=row["to_number"],
+        body=row["body"],
+        template_name=msg.template_name
+    )
+
+    # Record escalation in database
+    conn.execute(
+        "INSERT INTO escalations (sid, escalated_to, result) VALUES (?, ?, ?)",
+        (msg.sid, result.get("escalated_to", "whatsapp"), str(result.get("whatsapp_result", {})))
+    )
+    conn.commit()
+
+    # If WhatsApp succeeded, update message status
+    if result.get("whatsapp_result", {}).get("success"):
+        conn.execute(
+            "UPDATE messages SET status = ?, updated_at = ?, error_message = ?, carrier_ack = ? WHERE sid = ?",
+            ("delivered", __import__("datetime").datetime.utcnow().isoformat(), "Escalated to WhatsApp", "whatsapp-ack", msg.sid)
+        )
+    else:
+        conn.execute(
+            "UPDATE messages SET status = ?, updated_at = ?, error_message = ? WHERE sid = ?",
+            ("failed", __import__("datetime").datetime.utcnow().isoformat(), result.get("whatsapp_result", {}).get("error", "WhatsApp escalation failed"), msg.sid)
+        )
+    conn.commit()
+    conn.close()
+
+    return EscalationResponse(
+        sid=msg.sid,
+        escalated_to=result["escalated_to"],
+        result=result["whatsapp_result"]
+    )
+
+
+@app.get("/v1/escalations/{sid}")
+def get_escalation(sid: str):
+    conn = get_db()
+    row = conn.execute("SELECT * FROM escalations WHERE sid = ?", (sid,)).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="No escalation record found for this SID")
+    return {
+        "sid": row["sid"],
+        "escalated_to": row["escalated_to"],
+        "result": row["result"],
+        "timestamp": row["timestamp"]
+    }
+
+
+@app.get("/v1/messages/{message_sid}/escalations")
+def list_escalations_for_message(message_sid: str):
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM escalations WHERE sid = ? ORDER BY timestamp DESC", (message_sid,)).fetchall()
+    conn.close()
+    return [
+        {
+            "sid": r["sid"],
+            "escalated_to": r["escalated_to"],
+            "result": r["result"],
+            "timestamp": r["timestamp"]
+        } for r in rows
+    ]

@@ -36,5 +36,14 @@ class FailoverState(BaseModel):
     mode: str
     activated_at: Optional[str] = None
 
+class EscalationRequest(BaseModel):
+    sid: str = Field(..., description="Message SID to escalate")
+    template_name: Optional[str] = Field(None, description="WhatsApp template name (optional)")
+
+class EscalationResponse(BaseModel):
+    sid: str
+    escalated_to: str
+    result: dict
+
 class FailoverUpdate(BaseModel):
     mode: str = Field(..., description="normal, active, or test")

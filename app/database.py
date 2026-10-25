@@ -35,8 +35,18 @@ def init_db():
             last_health_check TEXT
         )
     """)
+    conn.execute("INSERT OR IGNORE INTO failover_state (id, mode) VALUES (1, 'normal')")
     conn.execute("""
-        INSERT OR IGNORE INTO failover_state (id, mode) VALUES (1, 'normal')
+        CREATE TABLE IF NOT EXISTS escalations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sid TEXT NOT NULL,
+            escalated_to TEXT DEFAULT 'whatsapp',
+            result TEXT,
+            timestamp TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_escalations_sid ON escalations(sid)
     """)
     conn.commit()
     conn.close()
